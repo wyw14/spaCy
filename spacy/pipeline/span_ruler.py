@@ -6,6 +6,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Optional,
@@ -30,7 +31,15 @@ from ..util import SimpleFrozenList, ensure_path
 from .pipe import Pipe
 
 PatternType = Dict[str, Union[str, List[Dict[str, Any]]]]
+ExcludePatternType = Dict[str, Any]
 DEFAULT_SPANS_KEY = "ruler"
+# Exclusion modes for `SpanRuler.exclude_on`:
+# "overlap" excludes a candidate if it overlaps an exclusion region at all
+# (boundary-adjacent spans do not overlap), "contained" only excludes a
+# candidate if it is fully contained in the exclusion region.
+EXCLUDE_ON_OVERLAP = "overlap"
+EXCLUDE_ON_CONTAINED = "contained"
+EXCLUDE_ON_VALUES = (EXCLUDE_ON_OVERLAP, EXCLUDE_ON_CONTAINED)
 
 
 def prioritize_new_ents_filter(
@@ -140,6 +149,7 @@ class SpanRuler(Pipe):
         scorer: Optional[Callable] = partial(
             overlapping_labeled_spans_score, spans_key=DEFAULT_SPANS_KEY
         ),
+        exclude_on: str = EXCLUDE_ON_OVERLAP,
     ) -> None:
         """Initialize the span ruler. If patterns are supplied here, they
         need to be a list of dictionaries with a `"label"` and `"pattern"`
@@ -175,6 +185,12 @@ class SpanRuler(Pipe):
             `annotate_ents` is set. Defaults to `True`.
         scorer (Optional[Callable]): The scoring method. Defaults to
             spacy.pipeline.span_ruler.overlapping_labeled_spans_score.
+        exclude_on (str): Determines how exclusion patterns (added via
+            `add_exclude_patterns`) filter the regular matches. With
+            `"overlap"` (the default) a candidate is excluded if it overlaps
+            an exclusion region at all (boundary-adjacent regions do not
+            count as overlapping). With `"contained"` a candidate is only
+            excluded if it is fully contained within an exclusion region.
 
         DOCS: https://spacy.io/api/spanruler#init
         """
@@ -189,6 +205,13 @@ class SpanRuler(Pipe):
         self.ents_filter = ents_filter
         self.scorer = scorer
         self.matcher_fuzzy_compare = matcher_fuzzy_compare
+        if exclude_on not in EXCLUDE_ON_VALUES:
+            raise ValueError(
+                Errors.E1058.format(
+                    value=exclude_on, valid=", ".join(EXCLUDE_ON_VALUES)
+                )
+            )
+        self.exclude_on = exclude_on
         self._match_label_id_map: Dict[int, Dict[str, str]] = {}
         self.clear()
 
@@ -243,7 +266,73 @@ class SpanRuler(Pipe):
             for m_id, start, end in matches
             if start != end
         )
-        return sorted(list(deduplicated_matches))
+        candidates = sorted(list(deduplicated_matches))
+        return self._apply_exclusions(doc, candidates)
+
+    def _get_exclude_regions(
+        self, doc: Doc
+    ) -> Set[Tuple[int, int, FrozenSet[str]]]:
+        """Run the exclusion matchers and return the matched exclusion
+        regions as a set of (start, end, labels) tuples. An empty `labels`
+        set means that the region applies to all candidate labels. The set
+        deduplicates any repeated hits of the same region so that duplicate
+        exclusion matches can never affect the remaining candidates.
+        """
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="\\[W036")
+            matches = cast(
+                List[Tuple[int, int, int]],
+                list(self.exclude_matcher(doc))
+                + list(self.exclude_phrase_matcher(doc)),
+            )
+        return set(
+            (
+                start,
+                end,
+                cast(
+                    FrozenSet[str],
+                    self._exclude_match_meta[m_id]["labels"],
+                ),
+            )
+            for m_id, start, end in matches
+            if start != end
+        )
+
+    def _apply_exclusions(
+        self, doc: Doc, candidates: List[Span]
+    ) -> List[Span]:
+        """Filter the candidate matches against the exclusion regions. The
+        candidates are already deduplicated and sorted, so this only removes
+        excluded entries without changing the relative order (or introducing
+        duplicates) of the remaining candidates. The surviving candidates are
+        subsequently handled by the original spans_filter/ents_filter and
+        overwrite rules in `set_annotations`.
+        """
+        if not self._exclude_patterns:
+            return candidates
+        regions = self._get_exclude_regions(doc)
+        if not regions:
+            return candidates
+        filtered = []
+        for candidate in candidates:
+            excluded = False
+            for r_start, r_end, r_labels in regions:
+                # An exclusion region with no explicit labels applies to all
+                # candidate labels, otherwise only to the listed labels.
+                if r_labels and candidate.label_ not in r_labels:
+                    continue
+                if self.exclude_on == EXCLUDE_ON_CONTAINED:
+                    overlaps = r_start <= candidate.start and candidate.end <= r_end
+                else:
+                    # Boundary-adjacent regions (e.g. candidate.end ==
+                    # r_start) do not overlap.
+                    overlaps = candidate.start < r_end and candidate.end > r_start
+                if overlaps:
+                    excluded = True
+                    break
+            if not excluded:
+                filtered.append(candidate)
+        return filtered
 
     def set_annotations(self, doc, matches):
         """Modify the document in place"""
@@ -319,6 +408,20 @@ class SpanRuler(Pipe):
         """
         return self._patterns
 
+    @property
+    def exclude_patterns(self) -> List[ExcludePatternType]:
+        """Get all exclusion patterns that were added to the span ruler.
+
+        Exclusion patterns only filter the matches produced by the regular
+        patterns; they are never written to `Doc.spans` or `Doc.ents`.
+
+        RETURNS (list): The original exclusion patterns, one dictionary per
+            pattern.
+
+        DOCS: https://spacy.io/api/spanruler#exclude_patterns
+        """
+        return self._exclude_patterns
+
     def add_patterns(self, patterns: List[PatternType]) -> None:
         """Add patterns to the span ruler. A pattern can either be a token
         pattern (list of dicts) or a phrase pattern (string). For example:
@@ -367,8 +470,79 @@ class SpanRuler(Pipe):
             ):
                 self.phrase_matcher.add(label, [pattern])
 
+    def add_exclude_patterns(self, patterns: List[ExcludePatternType]) -> None:
+        """Add exclusion patterns to the span ruler. Exclusion patterns
+        define context regions in which the regular patterns must not produce
+        any annotations. They never create spans or entities themselves, they
+        only filter the candidate matches of the regular patterns.
+
+        A pattern can either be a token pattern (list of dicts) or a phrase
+        pattern (string), just like a regular pattern. The optional `"labels"`
+        key holds a list of output labels the exclusion applies to; if it is
+        omitted (or empty), candidates with any label are excluded. The
+        optional `"id"` key can be used to remove the exclusion pattern again
+        with `remove_exclude_by_id`. For example:
+        {'pattern': 'Apple'}
+        {'pattern': 'Apple', 'labels': ['ORG']}
+        {'pattern': [{'lower': 'fake'}, {'lower': 'news'}], 'labels': ['ORG'],
+         'id': 'fake_news'}
+
+        Whether a candidate is excluded when it overlaps an exclusion region
+        at all or only when it is fully contained within it is controlled by
+        the `exclude_on` setting (`"overlap"` or `"contained"`).
+
+        patterns (list): The exclusion patterns to add.
+
+        DOCS: https://spacy.io/api/spanruler#add_exclude_patterns
+        """
+
+        # disable the nlp components after this one in case they haven't been
+        # initialized / deserialized yet
+        try:
+            current_index = -1
+            for i, (name, pipe) in enumerate(self.nlp.pipeline):
+                if self == pipe:
+                    current_index = i
+                    break
+            subsequent_pipes = [pipe for pipe in self.nlp.pipe_names[current_index:]]
+        except ValueError:
+            subsequent_pipes = []
+        with self.nlp.select_pipes(disable=subsequent_pipes):
+            phrase_pattern_keys = []
+            phrase_pattern_texts = []
+            for entry in patterns:
+                if not isinstance(entry, dict) or "pattern" not in entry:
+                    raise ValueError(Errors.E097.format(pattern=entry))
+                p_id = entry.get("id", "")
+                p_labels = entry.get("labels", [])
+                if not isinstance(p_labels, (list, tuple)) or not all(
+                    isinstance(p_label, str) for p_label in p_labels
+                ):
+                    raise ValueError(Errors.E1059.format(labels=p_labels))
+                # Use a unique matcher key per pattern so every exclusion
+                # pattern can be removed individually by its ID.
+                key = f"__span_ruler_exclude_{self._exclude_counter}__"
+                self._exclude_counter += 1
+                self._exclude_match_meta[self.nlp.vocab.strings.as_int(key)] = {
+                    "id": p_id,
+                    "labels": frozenset(p_labels),
+                }
+                if isinstance(entry["pattern"], str):
+                    phrase_pattern_keys.append(key)
+                    phrase_pattern_texts.append(entry["pattern"])
+                elif isinstance(entry["pattern"], list):
+                    self.exclude_matcher.add(key, [entry["pattern"]])
+                else:
+                    raise ValueError(Errors.E097.format(pattern=entry["pattern"]))
+                self._exclude_patterns.append(entry)
+            for key, pattern in zip(
+                phrase_pattern_keys,
+                self.nlp.pipe(phrase_pattern_texts),
+            ):
+                self.exclude_phrase_matcher.add(key, [pattern])
+
     def clear(self) -> None:
-        """Reset all patterns.
+        """Reset all patterns, including all exclusion patterns.
 
         RETURNS: None
         DOCS: https://spacy.io/api/spanruler#clear
@@ -380,6 +554,19 @@ class SpanRuler(Pipe):
             fuzzy_compare=self.matcher_fuzzy_compare,
         )
         self.phrase_matcher: PhraseMatcher = PhraseMatcher(
+            self.nlp.vocab,
+            attr=self.phrase_matcher_attr,
+            validate=self.validate,
+        )
+        self._exclude_patterns: List[ExcludePatternType] = []
+        self._exclude_match_meta: Dict[int, Dict[str, Any]] = {}
+        self._exclude_counter = 0
+        self.exclude_matcher: Matcher = Matcher(
+            self.nlp.vocab,
+            validate=self.validate,
+            fuzzy_compare=self.matcher_fuzzy_compare,
+        )
+        self.exclude_phrase_matcher: PhraseMatcher = PhraseMatcher(
             self.nlp.vocab,
             attr=self.phrase_matcher_attr,
             validate=self.validate,
@@ -428,6 +615,36 @@ class SpanRuler(Pipe):
                 if m_label_str in self.matcher:
                     self.matcher.remove(m_label_str)
 
+    def remove_exclude_by_id(self, pattern_id: str) -> None:
+        """Remove exclusion patterns by their pattern ID. All exclusion
+        patterns with the given ID are removed. A `ValueError` is raised if
+        the ID does not exist in any exclusion patterns.
+
+        pattern_id (str): ID of the exclusion pattern to be removed.
+        RETURNS: None
+        DOCS: https://spacy.io/api/spanruler#remove_exclude_by_id
+        """
+        orig_len = len(self._exclude_patterns)
+        self._exclude_patterns = [
+            p for p in self._exclude_patterns if p.get("id") != pattern_id
+        ]
+        if orig_len == len(self._exclude_patterns):
+            raise ValueError(
+                Errors.E1024.format(
+                    attr_type="exclusion ID",
+                    label=pattern_id,
+                    component=self.name,
+                )
+            )
+        for m_id in list(self._exclude_match_meta):
+            if self._exclude_match_meta[m_id]["id"] == pattern_id:
+                m_key = self.nlp.vocab.strings.as_string(m_id)
+                if m_key in self.exclude_phrase_matcher:
+                    self.exclude_phrase_matcher.remove(m_key)
+                if m_key in self.exclude_matcher:
+                    self.exclude_matcher.remove(m_key)
+                del self._exclude_match_meta[m_id]
+
     def _require_patterns(self) -> None:
         """Raise a warning if this component has no patterns defined."""
         if len(self) == 0:
@@ -446,6 +663,9 @@ class SpanRuler(Pipe):
         self.clear()
         deserializers = {
             "patterns": lambda b: self.add_patterns(srsly.json_loads(b)),
+            "exclude_patterns": lambda b: self.add_exclude_patterns(
+                srsly.json_loads(b)
+            ),
         }
         util.from_bytes(bytes_data, deserializers, exclude)
         return self
@@ -459,6 +679,7 @@ class SpanRuler(Pipe):
         """
         serializers = {
             "patterns": lambda: srsly.json_dumps(self.patterns),
+            "exclude_patterns": lambda: srsly.json_dumps(self.exclude_patterns),
         }
         return util.to_bytes(serializers, exclude)
 
@@ -474,8 +695,16 @@ class SpanRuler(Pipe):
         """
         self.clear()
         path = ensure_path(path)
+
+        def load_exclude_patterns(p: Path) -> None:
+            # The file is optional so that pipelines saved by older versions
+            # without exclusion patterns can still be loaded.
+            if p.exists():
+                self.add_exclude_patterns(srsly.read_jsonl(p))
+
         deserializers = {
             "patterns": lambda p: self.add_patterns(srsly.read_jsonl(p)),
+            "exclude_patterns": load_exclude_patterns,
         }
         util.from_disk(path, deserializers, {})
         return self
@@ -492,6 +721,9 @@ class SpanRuler(Pipe):
         path = ensure_path(path)
         serializers = {
             "patterns": lambda p: srsly.write_jsonl(p, self.patterns),
+            "exclude_patterns": lambda p: srsly.write_jsonl(
+                p, self.exclude_patterns
+            ),
         }
         util.to_disk(path, serializers, {})
 

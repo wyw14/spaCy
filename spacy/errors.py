@@ -988,6 +988,11 @@ class Errors(metaclass=ErrorsWithCodes):
     E1057 = ("The `TextCatReduce` architecture must be used with at least one "
              "reduction. Please enable one of `use_reduce_first`, "
              "`use_reduce_last`, `use_reduce_max` or `use_reduce_mean`.")
+    E1058 = ("Invalid value for `exclude_on`: '{value}'. Expected one of: "
+             "{valid}.")
+    E1059 = ("Invalid `labels` value in exclusion pattern: {labels}. Expected "
+             "a list of label strings, or no `labels` key to apply the "
+             "exclusion to all labels.")
 
 
 # Deprecated model shortcuts, only used in errors and warnings

@@ -27,6 +27,7 @@ from ..pipeline.senter import DEFAULT_SENTER_MODEL, SentenceRecognizer
 from ..pipeline.span_finder import DEFAULT_SPAN_FINDER_MODEL, SpanFinder
 from ..pipeline.span_ruler import (
     DEFAULT_SPANS_KEY as SPAN_RULER_DEFAULT_SPANS_KEY,
+    EXCLUDE_ON_OVERLAP as SPAN_RULER_EXCLUDE_ON_OVERLAP,
     SpanRuler,
     prioritize_existing_ents_filter,
     prioritize_new_ents_filter,
@@ -273,6 +274,7 @@ def register_factories() -> None:
             "matcher_fuzzy_compare": {"@misc": "spacy.levenshtein_compare.v1"},
             "validate": False,
             "overwrite": True,
+            "exclude_on": SPAN_RULER_EXCLUDE_ON_OVERLAP,
             "scorer": {
                 "@scorers": "spacy.overlapping_labeled_spans_scorer.v1",
                 "spans_key": SPAN_RULER_DEFAULT_SPANS_KEY,
@@ -707,6 +709,7 @@ def make_span_ruler(
     matcher_fuzzy_compare: Callable,
     validate: bool,
     overwrite: bool,
+    exclude_on: str,
     scorer: Optional[Callable],
 ):
     return SpanRuler(
@@ -721,6 +724,7 @@ def make_span_ruler(
         validate=validate,
         overwrite=overwrite,
         scorer=scorer,
+        exclude_on=exclude_on,
     )
 
 
