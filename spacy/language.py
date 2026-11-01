@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain, cycle
 from pathlib import Path
+from time import perf_counter
 from timeit import default_timer as timer
 from typing import (
     Any,
@@ -1059,6 +1060,74 @@ class Language:
             if not isinstance(doc, Doc):
                 raise ValueError(Errors.E005.format(name=name, returned_type=type(doc)))
         return doc
+
+    def timing(
+        self,
+        text: Union[str, Doc],
+        *,
+        disable: Iterable[str] = SimpleFrozenList(),
+        component_cfg: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[Doc, List[Tuple[str, float]]]:
+        """Process a single text or Doc once, like Language.__call__, but also
+        report how much wall-clock time tokenization and each executed
+        component take, so the caller can see where processing time is spent.
+
+        The text is tokenized once and then passed through the enabled
+        components in their current pipeline order, each called exactly once.
+        Components that are disabled permanently or via the `disable` argument
+        are not run and are not included in the report. The pipeline itself is
+        never modified: no component is enabled, disabled, reordered or
+        reconfigured. Durations are measured on the calling thread with a
+        monotonic clock (`time.perf_counter`) and are wall times, including
+        time spent waiting. They do not describe asynchronous GPU execution
+        and they are not throughput measurements for Language.pipe, which may
+        batch work across documents.
+
+        text (Union[str, Doc]): If `str`, the text to tokenize and process and
+            the report starts with the timing for tokenization. If `Doc`, the
+            doc is passed directly to the pipeline and tokenization is skipped,
+            just like in Language.__call__.
+        disable (List[str]): Names of the pipeline components to disable.
+        component_cfg (Dict[str, dict]): An optional dictionary with extra
+            keyword arguments for specific components.
+        RETURNS (Tuple[Doc, List[Tuple[str, float]]]): The processed Doc and a
+            list of `(name, seconds)` pairs in execution order. For string
+            input, the first entry is ("tokenizer", seconds), followed by one
+            entry per actually executed component. If a component raises, the
+            exception propagates or is passed to the configured error handler
+            exactly like in Language.__call__, and no incomplete report is
+            returned.
+
+        DOCS: https://spacy.io/api/language#timing
+        """
+        timings: List[Tuple[str, float]] = []
+        if isinstance(text, str):
+            # Time tokenization separately, only when it actually runs.
+            start = perf_counter()
+            doc = self.make_doc(text)
+            timings.append(("tokenizer", perf_counter() - start))
+        else:
+            # Same input handling/type checks as Language.__call__: a Doc
+            # passes through, bytes are deserialized and other types raise.
+            doc = self._ensure_doc(text)
+        if component_cfg is None:
+            component_cfg = {}
+        for name, proc in self.pipeline:
+            if name in disable:
+                continue
+            if not hasattr(proc, "__call__"):
+                raise ValueError(Errors.E003.format(component=type(proc), name=name))
+            doc, elapsed = _timed_pipe_call(
+                doc,
+                name,
+                proc,
+                component_cfg.get(name, {}),
+                self.default_error_handler,
+            )
+            if not isinstance(doc, Doc):
+                raise ValueError(Errors.E005.format(name=name, returned_type=type(doc)))
+            timings.append((name, elapsed))
+        return doc, timings
 
     def disable_pipes(self, *names) -> "DisabledPipes":
         """Disable one or more pipeline components. If used as a context
@@ -2371,6 +2440,34 @@ def _copy_examples(examples: Iterable[Example]) -> List[Example]:
     Language.update.
     """
     return [Example(eg.x.copy(), eg.y) for eg in examples]
+
+
+def _timed_pipe_call(
+    doc: Doc,
+    name: str,
+    proc: PipeCallable,
+    kwargs: Dict[str, Any],
+    default_error_handler: Callable[..., Any],
+) -> Tuple[Doc, float]:
+    """Call one pipeline component on a single Doc and return the (possibly
+    new) Doc together with the monotonic wall-clock time of the call, as
+    measured on the calling thread. Component errors are handled exactly like
+    in Language.__call__: KeyErrors are wrapped as E109 (typically a
+    component that wasn't initialized) and all other exceptions are passed to
+    the component's error handler or the pipeline's default handler.
+    """
+    error_handler = default_error_handler
+    if hasattr(proc, "get_error_handler"):
+        error_handler = proc.get_error_handler()
+    start = perf_counter()
+    try:
+        doc = proc(doc, **kwargs)  # type: ignore[call-arg]
+    except KeyError as e:
+        # This typically happens if a component is not initialized
+        raise ValueError(Errors.E109.format(name=name)) from e
+    except Exception as e:
+        error_handler(name, proc, [doc], e)
+    return doc, perf_counter() - start
 
 
 def _apply_pipes(

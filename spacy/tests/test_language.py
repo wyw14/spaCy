@@ -798,3 +798,265 @@ def test_component_return():
     nlp.add_pipe("test_component_bad_pipe")
     with pytest.raises(ValueError, match="instead of a Doc"):
         nlp("text")
+
+
+# Components and helpers for Language.timing tests. Registered once at import
+# time with stable function objects so re-registration doesn't conflict.
+_TIMING_CALLS = []
+
+
+def _make_timing_tracker(name):
+    def timing_tracker(doc):
+        _TIMING_CALLS.append(name)
+        return doc
+
+    return timing_tracker
+
+
+for _timing_name in (
+    "test_timing_a",
+    "test_timing_b",
+    "test_timing_c",
+    "test_timing_after",
+):
+    Language.component(_timing_name, func=_make_timing_tracker(_timing_name))
+
+_TIMING_CFG = {}
+
+
+def _timing_cfg_pipe(doc, marker=None, amount=0):
+    _TIMING_CFG["marker"] = marker
+    _TIMING_CFG["amount"] = amount
+    return doc
+
+
+Language.component("test_timing_cfg", func=_timing_cfg_pipe)
+
+
+def _timing_raise_pipe(doc):
+    raise ValueError("timing boom")
+
+
+Language.component("test_timing_raise", func=_timing_raise_pipe)
+
+
+def _timing_key_error_pipe(doc):
+    raise KeyError("missing")
+
+
+Language.component("test_timing_keyerror", func=_timing_key_error_pipe)
+
+
+def _timing_bad_return_pipe(doc):
+    return None
+
+
+Language.component("test_timing_badreturn", func=_timing_bad_return_pipe)
+
+
+def test_language_timing_order_single_run_and_doc():
+    """Tokenization and each enabled component run exactly once, in pipeline
+    order, and the returned Doc is the same as a normal single call."""
+    _TIMING_CALLS.clear()
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    nlp.add_pipe("test_timing_b")
+    nlp.add_pipe("test_timing_c")
+    text = "One document processed for timing."
+    doc, timings = nlp.timing(text)
+    assert _TIMING_CALLS == [
+        "test_timing_a",
+        "test_timing_b",
+        "test_timing_c",
+    ]
+    assert [name for name, _ in timings] == [
+        "tokenizer",
+        "test_timing_a",
+        "test_timing_b",
+        "test_timing_c",
+    ]
+    assert len(timings) == len({name for name, _ in timings})
+    assert all(isinstance(seconds, float) for _, seconds in timings)
+    assert all(seconds >= 0.0 for _, seconds in timings)
+    assert_docs_equal(doc, nlp(text))
+
+
+def test_language_timing_no_components():
+    nlp = English()
+    doc, timings = nlp.timing("just tokenization")
+    assert [name for name, _ in timings] == ["tokenizer"]
+    assert [token.text for token in doc] == ["just", "tokenization"]
+    assert_docs_equal(doc, nlp("just tokenization"))
+
+
+def test_language_timing_disable_and_unchanged_state():
+    """Permanently disabled and per-call disabled components are not run or
+    reported, and the call leaves the pipeline state untouched."""
+    _TIMING_CALLS.clear()
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    nlp.add_pipe("test_timing_b")
+    nlp.add_pipe("test_timing_c")
+    nlp.disable_pipe("test_timing_b")
+    component_names_before = list(nlp.component_names)
+    pipe_names_before = list(nlp.pipe_names)
+    disabled_before = list(nlp.disabled)
+    doc, timings = nlp.timing("hello", disable=["test_timing_c"])
+    assert _TIMING_CALLS == ["test_timing_a"]
+    assert [name for name, _ in timings] == ["tokenizer", "test_timing_a"]
+    assert list(nlp.component_names) == component_names_before
+    assert list(nlp.pipe_names) == pipe_names_before
+    assert list(nlp.disabled) == disabled_before == ["test_timing_b"]
+    assert_docs_equal(doc, nlp("hello", disable=["test_timing_c"]))
+
+
+def test_language_timing_repeated_calls():
+    """Calling timing repeatedly keeps processing each text exactly once and
+    doesn't accumulate state."""
+    _TIMING_CALLS.clear()
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    nlp.add_pipe("test_timing_b")
+    doc1, timings1 = nlp.timing("one")
+    doc2, timings2 = nlp.timing("two")
+    expected = ["tokenizer", "test_timing_a", "test_timing_b"]
+    assert [name for name, _ in timings1] == expected
+    assert [name for name, _ in timings2] == expected
+    assert _TIMING_CALLS == [
+        "test_timing_a",
+        "test_timing_b",
+        "test_timing_a",
+        "test_timing_b",
+    ]
+    assert doc1.text == "one"
+    assert doc2.text == "two"
+
+
+def test_language_timing_component_cfg():
+    """component_cfg is forwarded to the components exactly like in a normal
+    single call."""
+    nlp = English()
+    nlp.add_pipe("test_timing_cfg")
+    cfg = {"test_timing_cfg": {"marker": "x", "amount": 7}}
+    doc, timings = nlp.timing("hello", component_cfg=cfg)
+    assert _TIMING_CFG == {"marker": "x", "amount": 7}
+    assert [name for name, _ in timings] == ["tokenizer", "test_timing_cfg"]
+    assert_docs_equal(doc, nlp("hello", component_cfg=cfg))
+    # Defaults are used without component_cfg (None or omitted).
+    nlp.timing("hello")
+    assert _TIMING_CFG == {"marker": None, "amount": 0}
+    nlp.timing("hello", component_cfg=None)
+    assert _TIMING_CFG == {"marker": None, "amount": 0}
+
+
+def test_language_timing_doc_input():
+    """A Doc input is passed through and tokenization is skipped, matching
+    Language.__call__."""
+    _TIMING_CALLS.clear()
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    nlp.add_pipe("test_timing_b")
+    text = "Pass a doc directly."
+    doc_in = nlp.make_doc(text)
+    doc, timings = nlp.timing(doc_in)
+    assert doc is doc_in
+    assert _TIMING_CALLS == ["test_timing_a", "test_timing_b"]
+    assert [name for name, _ in timings] == ["test_timing_a", "test_timing_b"]
+    assert_docs_equal(doc, nlp(nlp.make_doc(text)))
+
+
+def test_language_timing_bytes_input():
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    doc_bytes = nlp.make_doc("bytes in").to_bytes()
+    doc, timings = nlp.timing(doc_bytes)
+    assert doc.text == "bytes in"
+    # Deserialization is not tokenization, so no tokenizer entry is reported.
+    assert [name for name, _ in timings] == ["test_timing_a"]
+
+
+def test_language_timing_invalid_input():
+    """Invalid input types raise the same error as a normal call."""
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    with pytest.raises(ValueError):
+        nlp(123)
+    with pytest.raises(ValueError):
+        nlp.timing(123)
+
+
+def test_language_timing_error_propagates():
+    """A failing component propagates the error like a normal call and no
+    report of successful steps is returned."""
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    nlp.add_pipe("test_timing_raise")
+    nlp.add_pipe("test_timing_after")
+    text = "fail here"
+    with pytest.raises(ValueError, match="timing boom"):
+        nlp(text)
+    with pytest.raises(ValueError, match="timing boom"):
+        nlp.timing(text)
+
+
+def test_language_timing_error_handler():
+    """A configured error handler that swallows errors is honored exactly as
+    in a normal call, and later components still run."""
+    _TIMING_CALLS.clear()
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    nlp.add_pipe("test_timing_raise")
+    nlp.add_pipe("test_timing_after")
+    nlp.default_error_handler = ignore_error
+    text = "swallowed error"
+    doc, timings = nlp.timing(text)
+    assert _TIMING_CALLS == ["test_timing_a", "test_timing_after"]
+    assert [name for name, _ in timings] == [
+        "tokenizer",
+        "test_timing_a",
+        "test_timing_raise",
+        "test_timing_after",
+    ]
+    assert all(isinstance(seconds, float) for _, seconds in timings)
+    assert_docs_equal(doc, nlp(text))
+
+
+def test_language_timing_key_error():
+    """A KeyError from a component is wrapped the same way as in __call__."""
+    nlp = English()
+    nlp.add_pipe("test_timing_keyerror")
+    with pytest.raises(ValueError):
+        nlp("x")
+    with pytest.raises(ValueError):
+        nlp.timing("x")
+
+
+def test_language_timing_bad_return():
+    """A component returning something other than a Doc is rejected as in a
+    normal call."""
+    nlp = English()
+    nlp.add_pipe("test_timing_badreturn")
+    with pytest.raises(ValueError, match="instead of a Doc"):
+        nlp("x")
+    with pytest.raises(ValueError, match="instead of a Doc"):
+        nlp.timing("x")
+
+
+def test_language_timing_controllable_clock(monkeypatch):
+    """Timings come from the monotonic clock reads around each step. A fake
+    clock makes the reported durations deterministic without relying on real
+    elapsed-time thresholds."""
+    _TIMING_CALLS.clear()
+    nlp = English()
+    nlp.add_pipe("test_timing_a")
+    nlp.add_pipe("test_timing_b")
+    nlp.disable_pipe("test_timing_a")
+    ticks = itertools.count(1.0, 1.0)
+    monkeypatch.setattr("spacy.language.perf_counter", lambda: next(ticks))
+    # Two clock reads per executed step: tokenizer + test_timing_b only.
+    doc, timings = nlp.timing("Some text to time.")
+    assert timings == [("tokenizer", 1.0), ("test_timing_b", 1.0)]
+    # Exactly four clock reads (two per step) means one instrumented pass.
+    assert next(ticks) == 5.0
+    assert _TIMING_CALLS == ["test_timing_b"]
+    assert doc.text == "Some text to time."

@@ -209,6 +209,43 @@ tokenization is skipped but the rest of the pipeline is run.
 | `n_process`     | Number of processors to use. Defaults to `1`. ~~int~~                                                                                                               |
 | **YIELDS**      | Documents in the order of the original text. ~~Doc~~                                                                                                                |
 
+## Language.timing {id="timing",tag="method",version="3.8"}
+
+Apply the pipeline to a single text or `Doc` exactly once and return the
+processed `Doc` together with an ordered report of the wall-clock time spent on
+tokenization and each pipeline component that actually runs. This is useful to
+see where processing time is spent for a specific text. The report is a list of
+`(name, seconds)` tuples in execution order, starting with `("tokenizer", ...)`
+for string input and followed by one entry per executed component. Components
+that are disabled permanently or via `disable` are not run and not included.
+
+The text is only processed once – the reported times are not estimated from
+repeated runs – and the pipeline's enabled state, component order and config are
+not modified. Durations are measured on the calling thread with a monotonic
+clock (`time.perf_counter`), so they are wall times that also include time spent
+waiting. They don't describe asynchronous GPU execution and they aren't
+throughput measurements for [`Language.pipe`](/api/language#pipe), which can
+batch work across documents. Component errors are handled exactly as in a
+regular call: the error propagates or is passed to the configured error
+handler, and no report is returned for steps that didn't complete.
+
+> #### Example
+>
+> ```python
+> doc, timings = nlp.timing("An example sentence.", disable=["ner"])
+> assert [name for name, _ in timings][0] == "tokenizer"
+> for name, seconds in timings:
+>     print(f"{name}: {seconds:.4f}s")
+> ```
+
+| Name            | Description                                                                                                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `text`          | The text to be processed, or a Doc (tokenization is then skipped and not reported). ~~Union[str, Doc]~~                                                                  |
+| _keyword-only_  |                                                                                                                                                                          |
+| `disable`       | Names of pipeline components to [disable](/usage/processing-pipelines#disabling). ~~List[str]~~                                                                         |
+| `component_cfg` | Optional dictionary of keyword arguments for components, keyed by component names. Defaults to `None`. ~~Optional[Dict[str, Dict[str, Any]]]~~                         |
+| **RETURNS**     | The processed `Doc` and the ordered `(name, seconds)` timing report. ~~Tuple[Doc, List[Tuple[str, float]]]~~                                                             |
+
 ## Language.set_error_handler {id="set_error_handler",tag="method",version="3"}
 
 Define a callback that will be invoked when an error is thrown during processing
