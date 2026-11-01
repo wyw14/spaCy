@@ -988,6 +988,13 @@ class Errors(metaclass=ErrorsWithCodes):
     E1057 = ("The `TextCatReduce` architecture must be used with at least one "
              "reduction. Please enable one of `use_reduce_first`, "
              "`use_reduce_last`, `use_reduce_max` or `use_reduce_mean`.")
+    E1058 = ("'{component}' is configured with `regions_key='{key}'`, but the "
+             "Doc has no span group `doc.spans['{key}']`. Add this span group "
+             "before running the component, or set "
+             "`on_missing_regions='skip'` to skip the document without adding "
+             "matches.")
+    E1059 = ("Invalid value {value} for `{setting}`. Expected one of: "
+             "{options}.")
 
 
 # Deprecated model shortcuts, only used in errors and warnings

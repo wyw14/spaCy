@@ -31,6 +31,16 @@ def overlapping_patterns():
 
 
 @pytest.fixture
+def region_patterns():
+    return [
+        {"label": "GREETING", "pattern": "hello world", "id": "hello_world"},
+        {"label": "BYE", "pattern": [{"LOWER": "bye"}, {"LOWER": "bye"}]},
+        {"label": "FOOBAR", "pattern": "foo bar"},
+        {"label": "BARBAZ", "pattern": "bar baz"},
+    ]
+
+
+@pytest.fixture
 def person_org_patterns():
     return [
         {"label": "PERSON", "pattern": "Dina"},
@@ -462,3 +472,214 @@ def test_span_ruler_ents_bad_filter(overlapping_patterns):
     ruler.add_patterns(overlapping_patterns)
     with pytest.raises(ValueError):
         ruler(nlp.make_doc("foo bar baz"))
+
+
+def test_span_ruler_regions_attributes():
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler",
+        config={"regions_key": "regions", "on_missing_regions": "raise"},
+    )
+    assert ruler.regions_key == "regions"
+    assert ruler.on_missing_regions == "raise"
+    # default remains whole-document matching
+    ruler_default = nlp.add_pipe(
+        "span_ruler", name="default_ruler", config={"spans_key": "default"}
+    )
+    assert ruler_default.regions_key is None
+    assert ruler_default.on_missing_regions == "skip"
+
+
+def test_span_ruler_regions_invalid_option():
+    nlp = spacy.blank("xx")
+    with pytest.raises(ValueError):
+        nlp.add_pipe(
+            "span_ruler", config={"regions_key": "regions",
+                                  "on_missing_regions": "bogus"}
+        )
+
+
+def test_span_ruler_regions_coordinates(region_patterns):
+    """Phrase and token rules are matched within regions at non-zero starts
+    and written back at their original document token coordinates."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe("span_ruler", config={"regions_key": "regions"})
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("xx hello world yy bye bye zz")
+    doc.spans["regions"] = [doc[1:3], doc[4:6]]
+    doc = ruler(doc)
+    assert [(s.start, s.end, s.label_, s.id_) for s in doc.spans["ruler"]] == [
+        (1, 3, "GREETING", "hello_world"),
+        (4, 6, "BYE", ""),
+    ]
+
+
+def test_span_ruler_regions_phrase_boundary(region_patterns):
+    """A phrase cannot match across adjacent region boundaries, while a
+    phrase fully inside one region still matches."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler",
+        config={"regions_key": "regions", "spans_key": "ruler"},
+    )
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("foo bar baz")
+    doc.spans["regions"] = [doc[0:2], doc[2:3]]
+    doc = ruler(doc)
+    # "foo bar" is contained in the first region, "bar baz" would straddle
+    # the boundary between the two adjacent regions and must not match
+    assert [(s.start, s.end, s.label_) for s in doc.spans["ruler"]] == [
+        (0, 2, "FOOBAR")
+    ]
+
+
+def test_span_ruler_regions_token_rule_boundary(region_patterns):
+    """Token patterns cannot match across region boundaries either."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler", config={"regions_key": "regions", "spans_key": "out"}
+    )
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("bye bye bye")
+    doc.spans["regions"] = [doc[0:1], doc[1:3]]
+    doc = ruler(doc)
+    # the BYE rule only fits into the second region
+    assert [(s.start, s.end, s.label_) for s in doc.spans["out"]] == [
+        (1, 3, "BYE")
+    ]
+
+
+def test_span_ruler_regions_overlapping_dedup(region_patterns):
+    """The same match produced by several overlapping regions is kept once."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe("span_ruler", config={"regions_key": "regions"})
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("hello world foo bar baz")
+    doc.spans["regions"] = [doc[0:5], doc[2:5], doc[0:2]]
+    doc = ruler(doc)
+    matches = [(s.start, s.end, s.label_) for s in doc.spans["ruler"]]
+    assert sorted(matches) == [
+        (0, 2, "GREETING"),
+        (2, 4, "FOOBAR"),
+        (3, 5, "BARBAZ"),
+    ]
+
+
+def test_span_ruler_regions_missing_skip(region_patterns):
+    """By default a missing region group skips the document silently."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe("span_ruler", config={"regions_key": "regions"})
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("hello world")
+    doc = ruler(doc)
+    assert "regions" not in doc.spans
+    assert len(doc.spans["ruler"]) == 0
+
+
+def test_span_ruler_regions_missing_raise(region_patterns):
+    """on_missing_regions='raise' raises for a missing region group."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler",
+        config={"regions_key": "regions", "on_missing_regions": "raise"},
+    )
+    ruler.add_patterns(region_patterns)
+    with pytest.raises(ValueError):
+        nlp("hello world")
+
+
+def test_span_ruler_regions_empty_group(region_patterns):
+    """An existing but empty region group never produces matches."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe("span_ruler", config={"regions_key": "regions"})
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("hello world foo bar")
+    doc.spans["regions"] = []
+    doc = ruler(doc)
+    assert len(doc.spans["ruler"]) == 0
+
+
+def test_span_ruler_regions_same_key_overwrite(region_patterns):
+    """Input and output groups may share a key; the input is read fully
+    before results are written. overwrite=True replaces the group."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler",
+        config={"regions_key": "ruler", "overwrite": True},
+    )
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("x hello world")
+    doc.spans["ruler"] = [doc[1:3]]
+    doc = ruler(doc)
+    assert [(s.start, s.end, s.label_) for s in doc.spans["ruler"]] == [
+        (1, 3, "GREETING")
+    ]
+
+
+def test_span_ruler_regions_same_key_no_overwrite(region_patterns):
+    """With overwrite=False the existing spans in the shared group are
+    preserved and the new matches are appended."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler",
+        config={"regions_key": "ruler", "overwrite": False},
+    )
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("x hello world")
+    doc.spans["ruler"] = [doc[1:3]]
+    doc = ruler(doc)
+    spans = [(s.start, s.end, s.label_) for s in doc.spans["ruler"]]
+    assert spans == [(1, 3, ""), (1, 3, "GREETING")]
+
+
+def test_span_ruler_regions_spans_filter(region_patterns):
+    """The spans_filter keeps working in region mode."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler",
+        config={
+            "regions_key": "regions",
+            "spans_filter": {"@misc": "spacy.first_longest_spans_filter.v1"},
+        },
+    )
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("x foo bar baz y")
+    doc.spans["regions"] = [doc[1:4]]
+    doc = ruler(doc)
+    assert len(doc.spans["ruler"]) == 1
+    assert doc.spans["ruler"][0].label_ == "FOOBAR"
+
+
+def test_span_ruler_regions_ents_filter(region_patterns):
+    """annotate_ents and the ents_filter keep working in region mode."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe(
+        "span_ruler",
+        config={"regions_key": "regions", "annotate_ents": True},
+    )
+    ruler.add_patterns(region_patterns)
+    doc = nlp.make_doc("x foo bar baz y")
+    doc.spans["regions"] = [doc[1:4]]
+    doc = ruler(doc)
+    assert [(e.start, e.end, e.label_) for e in doc.ents] == [
+        (1, 3, "FOOBAR")
+    ]
+
+
+def test_span_ruler_regions_serialize_dir(region_patterns):
+    """The region settings round-trip through nlp.to_disk / spacy.load."""
+    nlp = spacy.blank("xx")
+    ruler = nlp.add_pipe("span_ruler", config={"regions_key": "regions"})
+    ruler.add_patterns(region_patterns)
+    with make_tempdir() as d:
+        nlp.to_disk(d)
+        nlp2 = spacy.load(d)
+    ruler2 = nlp2.get_pipe("span_ruler")
+    assert ruler2.regions_key == "regions"
+    assert ruler2.on_missing_regions == "skip"
+    doc = nlp2.make_doc("hello world")
+    doc.spans["regions"] = [doc[0:2]]
+    doc = nlp2(doc)
+    assert [(s.start, s.end, s.label_) for s in doc.spans["ruler"]] == [
+        (0, 2, "GREETING")
+    ]

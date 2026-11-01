@@ -277,6 +277,8 @@ def register_factories() -> None:
                 "@scorers": "spacy.overlapping_labeled_spans_scorer.v1",
                 "spans_key": SPAN_RULER_DEFAULT_SPANS_KEY,
             },
+            "regions_key": None,
+            "on_missing_regions": "skip",
         },
         default_score_weights={
             f"spans_{SPAN_RULER_DEFAULT_SPANS_KEY}_f": 1.0,
@@ -708,6 +710,8 @@ def make_span_ruler(
     validate: bool,
     overwrite: bool,
     scorer: Optional[Callable],
+    regions_key: Optional[str],
+    on_missing_regions: str,
 ):
     return SpanRuler(
         nlp,
@@ -721,6 +725,8 @@ def make_span_ruler(
         validate=validate,
         overwrite=overwrite,
         scorer=scorer,
+        regions_key=regions_key,
+        on_missing_regions=on_missing_regions,
     )
 
 

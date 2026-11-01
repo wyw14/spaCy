@@ -13,6 +13,37 @@ The span ruler lets you add spans to [`Doc.spans`](/api/doc#spans) and/or
 usage examples, see the docs on
 [rule-based span matching](/usage/rule-based-matching#spanruler).
 
+## Restricting matches to regions {id="regions"}
+
+By default, all patterns are matched over the whole document. If you only want
+to find matches within certain parts of a document, provide their spans in a
+[`Doc.spans`](/api/doc#spans) group and pass its key as `regions_key`. The
+patterns are then matched independently inside each region span and the
+matches are written back with their original token coordinates in the
+document, so downstream the results look exactly like ordinary span ruler
+output.
+
+Rules never match across a region boundary, even when two regions are directly
+adjacent. The same match produced by overlapping regions is only added once.
+If the configured region group is missing from a document, the behavior is
+controlled by `on_missing_regions`: `"skip"` (default) adds no matches, while
+`"raise"` raises a `ValueError`. An existing but empty region group never
+produces matches. The input regions are read before the results are written, so
+the region group may use the same key as `spans_key`. The `spans_filter`,
+`ents_filter` and `overwrite` settings apply unchanged.
+
+> #### Example
+>
+> ```python
+> config = {"regions_key": "sections"}
+> ruler = nlp.add_pipe("span_ruler", config=config)
+> ruler.add_patterns([{"label": "ORG", "pattern": "Apple"}])
+> doc = nlp.make_doc("Apple Apple")
+> doc.spans["sections"] = [doc[1:2]]  # only match the second token
+> doc = ruler(doc)
+> assert [(s.start, s.end, s.label_) for s in doc.spans["ruler"]] == [(1, 2, "ORG")]
+> ```
+
 ## Assigned Attributes {id="assigned-attributes"}
 
 Matches will be saved to `Doc.spans[spans_key]` as a
@@ -56,6 +87,8 @@ how the component should be configured. You can override its settings via the
 | `matcher_fuzzy_compare` <Tag variant="new">3.5</Tag> | The fuzzy comparison method, passed on to the internal `Matcher`. Defaults to `spacy.matcher.levenshtein.levenshtein_compare`. ~~Callable~~                                                       |
 | `validate`                                           | Whether patterns should be validated, passed to `Matcher` and `PhraseMatcher` as `validate`. Defaults to `False`. ~~bool~~                                                              |
 | `overwrite`                                          | Whether to remove any existing spans under `Doc.spans[spans key]` if `spans_key` is set, or to remove any ents under `Doc.ents` if `annotate_ents` is set. Defaults to `True`. ~~bool~~ |
+| `regions_key`                                        | Optional key of a span group in [`Doc.spans`](/api/doc#spans) that restricts matching to the group's regions. If `None` (default), the patterns are matched over the whole document. ~~Optional[str]~~ |
+| `on_missing_regions`                                 | What to do if `regions_key` is set but the span group is missing from `Doc.spans`: `"skip"` (default, no matches are added) or `"raise"` (raise a `ValueError`). ~~str~~                |
 | `scorer`                                             | The scoring method. Defaults to [`Scorer.score_spans`](/api/scorer#score_spans) for `Doc.spans[spans_key]` with overlapping spans allowed. ~~Optional[Callable]~~                       |
 
 ```python
@@ -93,6 +126,8 @@ token pattern (list) or a phrase pattern (string). For example:
 | `matcher_fuzzy_compare` <Tag variant="new">3.5</Tag> | The fuzzy comparison method, passed on to the internal `Matcher`. Defaults to `spacy.matcher.levenshtein.levenshtein_compare`. ~~Callable~~                                                                                                   |
 | `validate`                                           | Whether patterns should be validated, passed to Matcher and PhraseMatcher as `validate`. Defaults to `False`. ~~bool~~                                                                                                              |
 | `overwrite`                                          | Whether to remove any existing spans under `Doc.spans[spans key]` if `spans_key` is set, or to remove any ents under `Doc.ents` if `annotate_ents` is set. Defaults to `True`. ~~bool~~                                             |
+| `regions_key`                                        | Optional key of a span group in [`Doc.spans`](/api/doc#spans) with regions to restrict matching to. If `None` (default), the patterns are matched over the whole document. ~~Optional[str]~~                                        |
+| `on_missing_regions`                                 | What to do if `regions_key` is set but the span group is missing from `Doc.spans`: `"skip"` (default, no matches are added) or `"raise"` (raise a `ValueError`). ~~str~~                                                            |
 | `scorer`                                             | The scoring method. Defaults to [`Scorer.score_spans`](/api/scorer#score_spans) for `Doc.spans[spans_key]` with overlapping spans allowed. ~~Optional[Callable]~~                                                                   |
 
 ## SpanRuler.initialize {id="initialize",tag="method"}

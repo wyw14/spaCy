@@ -31,6 +31,16 @@ from .pipe import Pipe
 
 PatternType = Dict[str, Union[str, List[Dict[str, Any]]]]
 DEFAULT_SPANS_KEY = "ruler"
+#: Match over the whole document (default, backwards-compatible behavior).
+DEFAULT_REGIONS_KEY = None
+#: When the configured input span group is missing, produce no matches.
+ON_MISSING_REGIONS_SKIP = "skip"
+#: When the configured input span group is missing, raise a ValueError.
+ON_MISSING_REGIONS_RAISE = "raise"
+ON_MISSING_REGIONS_OPTIONS = (
+    ON_MISSING_REGIONS_SKIP,
+    ON_MISSING_REGIONS_RAISE,
+)
 
 
 def prioritize_new_ents_filter(
@@ -140,6 +150,8 @@ class SpanRuler(Pipe):
         scorer: Optional[Callable] = partial(
             overlapping_labeled_spans_score, spans_key=DEFAULT_SPANS_KEY
         ),
+        regions_key: Optional[str] = DEFAULT_REGIONS_KEY,
+        on_missing_regions: str = ON_MISSING_REGIONS_SKIP,
     ) -> None:
         """Initialize the span ruler. If patterns are supplied here, they
         need to be a list of dictionaries with a `"label"` and `"pattern"`
@@ -175,9 +187,27 @@ class SpanRuler(Pipe):
             `annotate_ents` is set. Defaults to `True`.
         scorer (Optional[Callable]): The scoring method. Defaults to
             spacy.pipeline.span_ruler.overlapping_labeled_spans_score.
+        regions_key (Optional[str]): Optional key of a span group in
+            `Doc.spans` that restricts matching: the patterns are only
+            matched inside the spans of this group, never across region
+            boundaries, and the matches are written back with their original
+            document token coordinates. If `None` (default), the patterns are
+            matched over the whole document.
+        on_missing_regions (str): What to do if `regions_key` is set but the
+            span group is missing from `Doc.spans`. `"skip"` (default) skips
+            the document and produces no matches, while `"raise"` raises a
+            ValueError. An existing but empty group never produces matches.
 
         DOCS: https://spacy.io/api/spanruler#init
         """
+        if on_missing_regions not in ON_MISSING_REGIONS_OPTIONS:
+            raise ValueError(
+                Errors.E1059.format(
+                    value=repr(on_missing_regions),
+                    setting="on_missing_regions",
+                    options=", ".join(repr(opt) for opt in ON_MISSING_REGIONS_OPTIONS),
+                )
+            )
         self.nlp = nlp
         self.name = name
         self.spans_key = spans_key
@@ -189,6 +219,8 @@ class SpanRuler(Pipe):
         self.ents_filter = ents_filter
         self.scorer = scorer
         self.matcher_fuzzy_compare = matcher_fuzzy_compare
+        self.regions_key = regions_key
+        self.on_missing_regions = on_missing_regions
         self._match_label_id_map: Dict[int, Dict[str, str]] = {}
         self.clear()
 
@@ -226,12 +258,40 @@ class SpanRuler(Pipe):
 
     def match(self, doc: Doc):
         self._require_patterns()
+        # Read the input regions before any results are written to Doc.spans,
+        # so an input group with the same key as the output group cannot be
+        # mutated while it is being iterated.
+        regions = self._get_regions(doc)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="\\[W036")
-            matches = cast(
-                List[Tuple[int, int, int]],
-                list(self.matcher(doc)) + list(self.phrase_matcher(doc)),
-            )
+            if regions is None:
+                # Default: match over the whole document. Both matchers return
+                # document-absolute token coordinates.
+                matches = cast(
+                    List[Tuple[int, int, int]],
+                    list(self.matcher(doc)) + list(self.phrase_matcher(doc)),
+                )
+            else:
+                # Run the matchers on each region independently. Each matcher
+                # only returns matches that are fully contained in the region,
+                # so no rule can match across a region boundary, also when two
+                # regions are adjacent. The token Matcher reports coordinates
+                # relative to the region, which are offset back to the original
+                # document coordinates, whereas the PhraseMatcher already
+                # reports document-absolute coordinates when called on a Span.
+                # Identical matches from overlapping regions collapse into one
+                # through the Span deduplication below.
+                matches = []
+                for region in regions:
+                    offset = region.start
+                    matches.extend(
+                        (m_id, start + offset, end + offset)
+                        for m_id, start, end in self.matcher(region)
+                    )
+                    matches.extend(
+                        (m_id, start, end)
+                        for m_id, start, end in self.phrase_matcher(region)
+                    )
         deduplicated_matches = set(
             Span(
                 doc,
@@ -244,6 +304,28 @@ class SpanRuler(Pipe):
             if start != end
         )
         return sorted(list(deduplicated_matches))
+
+    def _get_regions(self, doc: Doc) -> Optional[List[Span]]:
+        """Get the input spans that restrict where patterns are matched.
+
+        Returns `None` when the patterns should be matched over the whole
+        document (the default), an empty list when no region group is
+        available and the component is configured to skip the document, or the
+        list of input regions otherwise.
+        """
+        if self.regions_key is None:
+            return None
+        if self.regions_key not in doc.spans:
+            if self.on_missing_regions == ON_MISSING_REGIONS_RAISE:
+                raise ValueError(
+                    Errors.E1058.format(
+                        component=type(self).__name__, key=self.regions_key
+                    )
+                )
+            return []
+        # Copy the group eagerly: it may share its key with the output group
+        # that is only written after matching has completed.
+        return list(doc.spans[self.regions_key])
 
     def set_annotations(self, doc, matches):
         """Modify the document in place"""
