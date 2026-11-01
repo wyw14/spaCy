@@ -1,3 +1,4 @@
+import operator
 import zlib
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Union
@@ -157,6 +158,62 @@ class DocBin:
                 user_data = srsly.msgpack_loads(self.user_data[i], use_list=False)
                 doc.user_data.update(user_data)
             yield doc
+
+    def select(self, indices: Iterable[int]) -> "DocBin":
+        """Create a new DocBin containing a subset of the documents,
+        selected by their integer indices. The annotations are copied at
+        the serialized-data level, so no Doc objects are reconstructed and
+        no language processing pipeline is run.
+
+        The document order in the new DocBin follows the order of the
+        provided indices. Indices can be repeated, in which case the same
+        document is included multiple times as an independent document.
+        An empty sequence returns an empty DocBin with the same `attrs` and
+        `store_user_data` settings.
+
+        All indices are validated before any data is copied: every index
+        must be a non-negative integer that is smaller than the number of
+        documents in this DocBin, otherwise a TypeError or IndexError is
+        raised. The returned DocBin is independent of this one: adding
+        documents to either DocBin or modifying its copied data does not
+        affect the other one. The string mappings required to reconstruct
+        the selected documents with `get_docs` are preserved.
+
+        indices (Iterable[int]): Finite sequence of document indices.
+        RETURNS (DocBin): A new DocBin with the selected documents.
+
+        DOCS: https://spacy.io/api/docbin#select
+        """
+        n_docs = len(self.tokens)
+        selected: List[int] = []
+        for index in indices:
+            try:
+                index = operator.index(index)
+            except TypeError:
+                raise TypeError(
+                    Errors.E1059.format(value=index, wtype=type(index).__name__)
+                ) from None
+            if index < 0 or index >= n_docs:
+                raise IndexError(Errors.E1058.format(index=index, length=n_docs))
+            selected.append(index)
+        docbin = DocBin.__new__(DocBin)
+        docbin.version = self.version
+        docbin.attrs = list(self.attrs)
+        docbin.store_user_data = self.store_user_data
+        docbin.tokens = [self.tokens[i].copy() for i in selected]
+        docbin.spaces = [self.spaces[i].copy() for i in selected]
+        docbin.cats = [dict(self.cats[i]) for i in selected]
+        docbin.span_groups = [self.span_groups[i] for i in selected]
+        docbin.flags = [dict(self.flags[i]) for i in selected]
+        if self.user_data:
+            docbin.user_data = [
+                self.user_data[i] if i < len(self.user_data) else None
+                for i in selected
+            ]
+        else:
+            docbin.user_data = []
+        docbin.strings = set(self.strings)
+        return docbin
 
     def merge(self, other: "DocBin") -> None:
         """Extend the annotations of this DocBin with the annotations from

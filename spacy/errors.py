@@ -988,6 +988,11 @@ class Errors(metaclass=ErrorsWithCodes):
     E1057 = ("The `TextCatReduce` architecture must be used with at least one "
              "reduction. Please enable one of `use_reduce_first`, "
              "`use_reduce_last`, `use_reduce_max` or `use_reduce_mean`.")
+    E1058 = ("Document index {index} is out of range for the DocBin, which "
+             "only contains {length} document(s). Indices must satisfy "
+             "0 <= index < {length}, and negative indices are not supported.")
+    E1059 = ("Invalid document index: {value} (type '{wtype}'). All document "
+             "indices must be integers.")
 
 
 # Deprecated model shortcuts, only used in errors and warnings
